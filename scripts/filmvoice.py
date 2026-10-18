@@ -306,4 +306,15 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 任何异常都收敛成一行 RESULT，避免把 traceback 抛给调用方（看起来像程序崩了）。
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("RESULT:" + json.dumps({"ok": False, "error": "已中断"}, ensure_ascii=False))
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001 - 统一出口
+        message = str(exc).strip().replace("\n", " ")[:600] or exc.__class__.__name__
+        print("RESULT:" + json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+        sys.exit(1)
