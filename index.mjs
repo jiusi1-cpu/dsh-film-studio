@@ -11,7 +11,7 @@
  * 文件系统技能提供器自动加载（不依赖 @deepseek-ai/* 能否在本包内解析）。
  */
 import { spawn } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -21,7 +21,8 @@ export const inject = ['tools']
 
 const PKG_DIR = dirname(fileURLToPath(import.meta.url))
 const SKILL_NAME = 'flash-motion'
-const SKILL_VERSION = '1.2.0'
+const SKILL_NAMES = ['flash-motion', 'film-studio']
+const SKILL_VERSION = '1.3.0'
 
 const TEXT_OUTPUT = {
   schema: {
@@ -109,7 +110,8 @@ function run(cmd, args, { cwd, timeoutMs = 1_800_000, env } = {}) {
   return new Promise(done => {
     const child = spawn(cmd, args, {
       cwd,
-      env: { ...process.env, ...(env ?? {}) },
+      // 强制 UTF-8：Windows 下 python 默认可能用 GBK 输出，中文日志和 RESULT 行会乱码/解析失败。
+      env: { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', ...process.env, ...(env ?? {}) },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -187,6 +189,16 @@ async function runPython(preferred, argv, opts) {
   }
 }
 
+/** 探针：确认到底哪个 python 能用，给自检工具用。 */
+async function probePython(preferred) {
+  const tried = pythonCandidates(preferred)
+  for (const cmd of tried) {
+    const r = await run(cmd, ['-c', 'import sys;print(sys.version.split()[0])'], { timeoutMs: 20_000 })
+    if (r.code === 0) return { ok: true, cmd, version: r.out.trim() || '?', tried }
+  }
+  return { ok: false, tried }
+}
+
 function tail(text, lines = 6) {
   return String(text || '')
     .trim()
@@ -195,22 +207,49 @@ function tail(text, lines = 6) {
     .join('\n')
 }
 
-/** 把随包的技能铺到 <DSH_HOME>/skills/，由宿主已有的文件系统提供器自动加载。 */
+/**
+ * 把随包的技能铺到 <DSH_HOME>/skills/。
+ * 注意：绝不能"先删后拷"——拷贝中途失败会让技能凭空消失（出过一次）。
+ * 这里先完整拷到 staging，校验通过后再用 rename 换上去，失败就保留原样。
+ */
 function installSkill(skillName, logger) {
   const target = join(dshHome(), 'skills', skillName)
   const marker = join(target, '.installed-version')
+  const staging = `${target}.staging-${process.pid}`
+  const backup = `${target}.old-${process.pid}`
   try {
     const src = join(PKG_DIR, 'skills', skillName)
     if (!existsSync(src)) return { ok: false, reason: `包内缺少 skills/${skillName}` }
+
     const installed = existsSync(marker) ? readFileSync(marker, 'utf8').trim() : ''
-    if (installed === SKILL_VERSION) return { ok: true, path: target, changed: false }
+    const intact = existsSync(join(target, 'SKILL.md'))
+    if (installed === SKILL_VERSION && intact) return { ok: true, path: target, changed: false }
+
     mkdirSync(dirname(target), { recursive: true })
-    rmSync(target, { recursive: true, force: true })
-    cpSync(src, target, { recursive: true })
-    writeFileSync(marker, SKILL_VERSION, 'utf8')
-    logger?.info?.(`film-studio: 技能 ${skillName} 已安装到 ${target}`)
+    rmSync(staging, { recursive: true, force: true })
+    cpSync(src, staging, { recursive: true })
+    if (!existsSync(join(staging, 'SKILL.md'))) throw new Error('复制结果不完整（缺 SKILL.md）')
+    writeFileSync(join(staging, '.installed-version'), SKILL_VERSION, 'utf8')
+
+    rmSync(backup, { recursive: true, force: true })
+    if (existsSync(target)) renameSync(target, backup)
+    try {
+      renameSync(staging, target)
+    } catch (error) {
+      if (existsSync(backup)) renameSync(backup, target)
+      throw error
+    }
+    rmSync(backup, { recursive: true, force: true })
+
+    logger?.info?.(`film-studio: 技能 ${skillName} 已更新到 ${target}`)
     return { ok: true, path: target, changed: true }
   } catch (error) {
+    rmSync(staging, { recursive: true, force: true })
+    if (!existsSync(target) && existsSync(backup)) {
+      try {
+        renameSync(backup, target)
+      } catch {}
+    }
     logger?.warn?.(`film-studio: 安装技能 ${skillName} 失败 ${error.message}`)
     return { ok: false, reason: error.message }
   }
@@ -254,7 +293,7 @@ export function apply(ctx, config = {}) {
   }
 
   const registered = []
-  const skillStates = ['flash-motion', 'film-studio'].map(n => ({ name: n, ...installSkill(n, ctx.logger) }))
+  const skillStates = SKILL_NAMES.map(n => ({ name: n, ...installSkill(n, ctx.logger) }))
   if (loadState !== 'ok') ctx.logger?.warn?.(`film-studio: 启动标记写入失败（${loadState}）`)
 
   ctx.effect(
@@ -476,17 +515,33 @@ export function apply(ctx, config = {}) {
             }
             const fm = join(skillPath(), 'scripts', 'fm.py')
             if (!existsSync(fm)) return { text: `找不到 ${fm}，技能可能没装好` }
-            const argv = [fm, 'render', clean(args.html) || 'index.html',
-              '--out', clean(args.out) || join('out', 'film.mp4'),
-              '--mblur', String(Number.isFinite(args.mblur) ? args.mblur : 2),
-              '--workers', String(Number.isFinite(args.workers) ? args.workers : 3)]
-            if (args.audio === false) argv.push('--no-audio')
-            if (args.force !== false) argv.push('--force')
-            const r = await runPython(python, argv, { cwd })
-            const keys = ['[OK]', '[ERR]', '[INFO] 渲染']
-            const summary = r.out.split(/\r?\n/).filter(x => keys.some(k => x.startsWith(k)))
-            const t = summary.slice(-4).join('\n') || tail(r.err, 8)
-            return { text: r.code === 0 ? `${t}\n渲染完成` : `渲染失败（退出码 ${r.code}）\n${t}` }
+
+            // 同一个工程同时跑两次渲染会互相覆盖帧文件，这里用锁文件挡住。
+            const lock = join(cwd, '.film-render.lock')
+            try {
+              const holder = Number(readFileSync(lock, 'utf8').trim())
+              if (holder && holder !== process.pid) {
+                process.kill(holder, 0)
+                return { text: `这个工程正在渲染（PID ${holder}），等它跑完再来。\n如果确认已经中断，删掉 ${lock} 再试。` }
+              }
+            } catch {}
+            writeFileSync(lock, String(process.pid), 'utf8')
+
+            try {
+              const argv = [fm, 'render', clean(args.html) || 'index.html',
+                '--out', clean(args.out) || join('out', 'film.mp4'),
+                '--mblur', String(Number.isFinite(args.mblur) ? args.mblur : 2),
+                '--workers', String(Number.isFinite(args.workers) ? args.workers : 3)]
+              if (args.audio === false) argv.push('--no-audio')
+              if (args.force !== false) argv.push('--force')
+              const r = await runPython(python, argv, { cwd })
+              const keys = ['[OK]', '[ERR]', '[INFO] 渲染']
+              const summary = r.out.split(/\r?\n/).filter(x => keys.some(k => x.startsWith(k)))
+              const t = summary.slice(-4).join('\n') || tail(r.err, 8)
+              return { text: r.code === 0 ? `${t}\n渲染完成` : `渲染失败（退出码 ${r.code}）\n${t}` }
+            } finally {
+              rmSync(lock, { force: true })
+            }
           },
         }),
       )
@@ -494,6 +549,66 @@ export function apply(ctx, config = {}) {
       return d
     },
     'film-studio: film_render',
+  )
+
+  ctx.effect(
+    () => {
+      const d = ctx.tools.register(
+        defineTool({
+          name: 'film_doctor',
+          description:
+            '自检短片工坊的运行环境：代码从哪加载、版本是否一致、两个技能是否装好、python 能不能用、密钥是否配置、工作区是否可写。工具"看不到"或"一调用就报错"时先跑它，一条命令看清是哪一层坏了。',
+          parameters: {},
+          output: TEXT_OUTPUT,
+          timeoutMs: 120_000,
+          async execute(args, exec) {
+            const rows = []
+            rows.push(`代码：${fileURLToPath(import.meta.url)}`)
+            try {
+              const pkg = JSON.parse(readFileSync(join(PKG_DIR, 'package.json'), 'utf8'))
+              rows.push(`插件版本：${pkg.version}｜技能应装版本：${SKILL_VERSION}`)
+            } catch (error) {
+              rows.push(`插件版本：读不到 package.json（${error.message}）`)
+            }
+
+            for (const skillName of SKILL_NAMES) {
+              const dir = join(dshHome(), 'skills', skillName)
+              const hasFile = existsSync(join(dir, 'SKILL.md'))
+              const marker = join(dir, '.installed-version')
+              const v = existsSync(marker) ? readFileSync(marker, 'utf8').trim() : '无'
+              const stale = v !== SKILL_VERSION ? '（需更新）' : ''
+              rows.push(`技能 ${skillName}：${hasFile ? '已装' : '缺失'}，版本 ${v}${stale}`)
+            }
+
+            const probe = await probePython(python)
+            rows.push(
+              probe.ok
+                ? `python：可用（${probe.cmd}，${probe.version}）`
+                : `python：不可用，试过 ${probe.tried.join('、')}；把 pythonPath 设成 python.exe 绝对路径`,
+            )
+
+            rows.push(`密钥：${apiKeyOf() ? '已配置' : '未配置（配音会失败，其余功能可用）'}`)
+
+            const root = workflowOf(exec)
+            let writable = false
+            try {
+              const probeFile = join(root, `.film-doctor-${process.pid}`)
+              writeFileSync(probeFile, 'ok', 'utf8')
+              rmSync(probeFile, { force: true })
+              writable = true
+            } catch {}
+            rows.push(`工作区：${root}（${writable ? '可写' : '不可写'}）`)
+
+            const bad = rows.filter(x => /缺失|不可用|未配置|不可写|需更新|读不到/.test(x))
+            rows.push(bad.length ? `结论：${bad.length} 项需要处理（见上）` : '结论：一切正常')
+            return { text: rows.join('\n') }
+          },
+        }),
+      )
+      registered.push('film_doctor')
+      return d
+    },
+    'film-studio: film_doctor',
   )
 
   try {

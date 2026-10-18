@@ -49,15 +49,25 @@ pnpm add file:/path/to/dsh-film-studio
 pythonPath: 'C:/Users/<你>/AppData/Local/Programs/Python/Python311/python.exe'
 ```
 
-插件会注册四个工具，并把技能铺到 `<DSH_HOME>/skills/`：
+插件会注册五个工具，并把技能铺到 `<DSH_HOME>/skills/`：
 
 - `film_new` — 生成影片工程骨架
 - `film_voice` — 配音 + 生成时间轴（默认小俏，不用选）
 - `film_check` — 质检，必须 0 错误
 - `film_render` — 逐帧渲染成片
+- `film_doctor` — 环境自检（代码来源、技能版本、python、密钥、工作区），出问题先跑它
+
+### 稳定性设计
+
+这几条是踩坑之后加的，装的时候不用管，出问题时它们管用：
+
+- **技能安装是"先暂存再替换"**：先完整拷到 `*.staging-<pid>`，校验 `SKILL.md` 在、写完版本号，才用 rename 换上去；中途失败会回滚，不会出现"技能凭空消失"。已装版本且文件完整时直接跳过，不重复拷。
+- **UTF-8 强制**：所有 python 子进程都带 `PYTHONIOENCODING=utf-8` / `PYTHONUTF8=1`，避免 Windows 上 GBK 输出把中文和 `RESULT` 行弄坏。
+- **渲染锁**：同一个工程目录同时只能跑一个渲染，第二个会被 `.film-render.lock` 挡住（锁里记 PID，进程已死则自动放行）。
+- **python 兜底探测**：配置值 → `DSH_PYTHON` → `PYTHON` → `python`/`python3`/`py` → 扫描用户目录下的 Python 安装。
 
 启动后会在 `<DSH_HOME>/cache/film-studio/` 留两个标记文件，排查加载问题很方便：
-`loaded.json`（apply 是否跑起来）和 `tools.json`（四个工具是否注册成功）。
+`loaded.json`（apply 是否跑起来）和 `tools.json`（五个工具是否注册成功）。
 
 ### 只想要配音（不装插件）
 
