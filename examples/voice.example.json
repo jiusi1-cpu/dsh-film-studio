@@ -1,0 +1,17 @@
+{
+  "sentences": [
+    "这是一个可以直接运行的配音示例。",
+    "默认音色是小俏，语速零点九二。",
+    "把这一行换成你自己的文案就行。"
+  ],
+  "outDir": "out/voice",
+  "voice": "xuxiaoqiao_v3.1",
+  "rate": 0.92,
+  "sceneGroups": {
+    "hook": [0, 0],
+    "point": [1, 2]
+  },
+  "gap": 0.3,
+  "leadingSilence": 0.45,
+  "tail": 2.65
+}

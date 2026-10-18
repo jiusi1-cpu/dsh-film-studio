@@ -1,0 +1,20 @@
+# dsh-film-studio 的挂载片段（DSH 桌面端 bundle patch）
+#
+# 用法：把这一行加进你的 profile（profiles/<名字>/cordis.patch.yml），
+# 或在插件管理器里安装本包后由它自动挂载。
+#
+# 注意：apiKey 留空，改用环境变量 ALIYUN_BAILIAN_API_KEY，不要把密钥写进仓库。
+
+- insert:
+    - id: film-studio
+      name: dsh-film-studio
+      config:
+        # 百炼业务空间地址，换成你自己的（控制台 → 业务空间详情）
+        baseUrl: 'https://dashscope.aliyuncs.com'
+        # 留空则读环境变量 ALIYUN_BAILIAN_API_KEY / DASHSCOPE_API_KEY
+        apiKey: ''
+        # 默认配音：官方固定音色（小俏）。可选 qiaoxiaojiao_v3.1 / yunhuanhuan_v3.1
+        defaultVoice: xuxiaoqiao_v3.1
+        # 语速：1.0 原速，0.85 明显放慢
+        defaultRate: 0.92
+        pythonPath: python

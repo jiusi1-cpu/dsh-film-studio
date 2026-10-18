@@ -1,0 +1,23 @@
+# 依赖与构建产物
+node_modules/
+pnpm-lock.yaml
+
+# 成片与中间文件
+out/
+*.mp4
+*.wav
+*.mp3
+*.png
+!docs/**/*.png
+
+# 密钥与本地配置
+.env
+.env.*
+*.local
+*.bak
+*.bak-*
+cordis.patch.local.yml
+
+# 系统
+.DS_Store
+Thumbs.db

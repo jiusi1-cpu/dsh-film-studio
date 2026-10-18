@@ -1,0 +1,44 @@
+{
+  "name": "dsh-film-studio",
+  "version": "1.0.0",
+  "description": "短视频工坊：阿里云百炼固定音色配音 + 逐帧渲染，把「写画面 → 配音 → 质检 → 成片」做成一键流程",
+  "keywords": [
+    "dsh-plugin",
+    "text-to-video",
+    "tts",
+    "aliyun",
+    "dashscope",
+    "qwen",
+    "video",
+    "skill"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*": "./locale/*"
+  },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "locale",
+    "scripts",
+    "skills",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
