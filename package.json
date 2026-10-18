@@ -1,6 +1,6 @@
 {
   "name": "dsh-film-studio",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "短视频工坊：阿里云百炼固定音色配音 + 逐帧渲染，把「写画面 → 配音 → 质检 → 成片」做成一键流程",
   "keywords": [
     "dsh-plugin",

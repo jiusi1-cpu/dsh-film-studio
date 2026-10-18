@@ -32,12 +32,32 @@ pnpm add file:/path/to/dsh-film-studio
 
 然后把 `cordis.patch.yml` 里那段 `insert` 加进 profile 的 `cordis.patch.yml`，重启桌面端。
 
+如果插件目录不在 profile 的 `node_modules` 里（比如直接放在别处），改用绝对 `file://` 挂载更稳：
+
+```yaml
+- insert:
+    - id: film-studio
+      name: file:///E:/path/to/dsh-film-studio/index.mjs
+      config: { ... }
+```
+
+**Windows 上务必确认 python 能被找到。** 桌面端进程的 `PATH` 常常不含 python，插件会依次尝试
+`pythonPath` → `DSH_PYTHON` → `PYTHON` → `python` / `python3` / `py` → 用户目录下的 `AppData\Local\Programs\Python\*\python.exe`。
+都不行就把 `pythonPath` 写成绝对路径：
+
+```yaml
+pythonPath: 'C:/Users/<你>/AppData/Local/Programs/Python/Python311/python.exe'
+```
+
 插件会注册四个工具，并把技能铺到 `<DSH_HOME>/skills/`：
 
 - `film_new` — 生成影片工程骨架
 - `film_voice` — 配音 + 生成时间轴（默认小俏，不用选）
 - `film_check` — 质检，必须 0 错误
 - `film_render` — 逐帧渲染成片
+
+启动后会在 `<DSH_HOME>/cache/film-studio/` 留两个标记文件，排查加载问题很方便：
+`loaded.json`（apply 是否跑起来）和 `tools.json`（四个工具是否注册成功）。
 
 ### 只想要配音（不装插件）
 
@@ -73,6 +93,16 @@ python scripts/filmvoice.py --job examples/voice.example.json
 ```
 
 `sceneGroups` 把句子映射到场景，脚本据此算出每个场景的起止时间并写出 `timeline.js`；你的 HTML 读 `window.TL` 即可。
+
+### 路径规则
+
+插件的四个工具，路径参数（`projectDir`、`outDir`、`name`）**相对路径一律按当前工作区解析**，也可以直接传绝对路径：
+
+- `film_check projectDir="my-film"` → `<工作区>/my-film`
+- `film_check projectDir="C:/work/film"` → 原样使用
+- `film_voice outDir="out/voice"` → `<工作区>/out/voice`
+
+目录不存在时会直接告诉你解析后的绝对路径，而不是抛一个容易误判的 `spawn python ENOENT`。
 
 ## 配音参数
 

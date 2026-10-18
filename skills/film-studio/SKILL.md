@@ -17,6 +17,16 @@ description: 做带配音的短视频（16:9 讲解片、项目解读、周报�
 
 配音只要有 Key 就能单独用，不依赖 flash-motion。
 
+## 路径规则（踩过坑，务必遵守）
+
+所有工具的路径参数（`projectDir`、`outDir`、`name`）**相对路径一律按工作区解析**，也可以直接给绝对路径。
+
+- ✅ `film_check projectDir="my-film"` → `<工作区>/my-film`
+- ✅ `film_check projectDir="C:/Users/xxx/proj/film"` → 原样使用
+- ❌ 不要假设相对路径会落到工程本身里；写 `out/voice` 就是 `<工作区>/out/voice`
+
+如果返回「工程目录不存在」，八成是相对路径写错了，换绝对路径最快。
+
 ## 0. 先确认三件事
 
 1. 工程目录：用户的工作区下新建 `<项目名>/`，或沿用已有工程。

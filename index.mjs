@@ -14,14 +14,14 @@ import { spawn } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export const name = 'film-studio'
 export const inject = ['tools']
 
 const PKG_DIR = dirname(fileURLToPath(import.meta.url))
 const SKILL_NAME = 'flash-motion'
-const SKILL_VERSION = '1.1.0'
+const SKILL_VERSION = '1.2.0'
 
 const TEXT_OUTPUT = {
   schema: {
@@ -34,7 +34,8 @@ const TEXT_OUTPUT = {
 
 /* ── defineTool 兜底 ── */
 
-function paramsToJsonSchema(spec = {}) {
+/** 把「属性规格」写法（属性里写 required: true）转成真正的 JSON Schema。入参是裸属性表。 */
+function propsToJsonSchema(spec = {}) {
   const properties = {}
   const required = []
   for (const [key, value] of Object.entries(spec)) {
@@ -42,16 +43,29 @@ function paramsToJsonSchema(spec = {}) {
     properties[key] = rest
     if (isRequired === true) required.push(key)
   }
-  return { type: 'object', properties, ...(required.length > 0 ? { required } : {}), additionalProperties: false }
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties,
+    ...(required.length > 0 ? { required } : {}),
+  }
+}
+
+/** output.schema 已经是 {type:'object',properties:{...}} 形状，只把 required:true 提到数组里。 */
+function normalizeOutputSchema(schema = {}) {
+  if (!schema || schema.type !== 'object' || !schema.properties) return schema
+  return propsToJsonSchema(schema.properties)
 }
 
 function fallbackDefineTool(options) {
   return {
     name: options.name,
     description: options.description,
-    parameters: paramsToJsonSchema(options.parameters),
+    parameters: propsToJsonSchema(options.parameters),
     output: {
-      schema: options.output?.schema ?? {},
+      // 关键：output.schema 必须是合法 JSON Schema，否则 tools.register 会拒绝整个工具
+      // （JSON Schema 里 required 是字符串数组，不是属性上的布尔值）。
+      schema: normalizeOutputSchema(options.output?.schema ?? {}),
       render: options.output?.render ?? (() => []),
     },
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
@@ -59,8 +73,29 @@ function fallbackDefineTool(options) {
   }
 }
 
-const toolsModule = await import('@deepseek-ai/dsh-tools').catch(() => undefined)
-const defineTool = toolsModule?.defineTool ?? fallbackDefineTool
+/**
+ * 优先用宿主的真实 defineTool：
+ * 本插件装在插件目录里，Node 从它所在位置向上找不到 @deepseek-ai/dsh-tools，
+ * 所以再按宿主安装目录的绝对路径试一次，最后才退回兜底实现。
+ */
+async function loadDefineTool() {
+  const tries = ['@deepseek-ai/dsh-tools']
+  const resources = process.resourcesPath
+  if (resources) {
+    tries.push(
+      pathToFileURL(join(resources, 'app', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js')).href,
+    )
+  }
+  for (const spec of tries) {
+    try {
+      const mod = await import(spec)
+      if (typeof mod?.defineTool === 'function') return mod.defineTool
+    } catch {}
+  }
+  return fallbackDefineTool
+}
+
+const defineTool = await loadDefineTool()
 
 /* ── 小工具 ── */
 
@@ -110,6 +145,48 @@ function run(cmd, args, { cwd, timeoutMs = 1_800_000, env } = {}) {
   })
 }
 
+/**
+ * 有些宿主进程的 PATH 里没有 python（桌面端常这样）。
+ * 按候选逐个试：配置值 → 环境变量 → PATH 上的常见名 → Windows 用户级安装目录。
+ * 不写死任何个人路径，换机器也能用。
+ */
+function pythonCandidates(preferred) {
+  const list = []
+  const push = item => {
+    if (item && !list.includes(item)) list.push(item)
+  }
+  push(preferred)
+  push(process.env.DSH_PYTHON)
+  push(process.env.PYTHON)
+  push('python')
+  push('python3')
+  push('py')
+  if (process.platform === 'win32') {
+    const base = join(homedir(), 'AppData', 'Local', 'Programs', 'Python')
+    try {
+      for (const dir of readdirSync(base)) {
+        const exe = join(base, dir, 'python.exe')
+        if (existsSync(exe)) push(exe)
+      }
+    } catch {}
+  }
+  return list
+}
+
+async function runPython(preferred, argv, opts) {
+  const tried = pythonCandidates(preferred)
+  let last = { code: -2, out: '', err: 'python 未找到' }
+  for (const cmd of tried) {
+    const result = await run(cmd, argv, opts)
+    if (result.code !== -2 || !/ENOENT/.test(result.err)) return result
+    last = result
+  }
+  return {
+    ...last,
+    err: `${last.err}\n已尝试：${tried.join(', ')}。可把插件配置的 pythonPath 设成 python.exe 的绝对路径（环境变量 DSH_PYTHON 也可以）。`,
+  }
+}
+
 function tail(text, lines = 6) {
   return String(text || '')
     .trim()
@@ -148,17 +225,41 @@ export function apply(ctx, config = {}) {
     clean(config.workspace) || clean(exec?.agent?.session?.header?.cwd) || process.cwd()
   const apiKeyOf = () => clean(config.apiKey)
   const baseUrlOf = () => clean(config.baseUrl) || 'https://dashscope.aliyuncs.com'
+  /**
+   * 所有传入路径一律按工作区解析：相对路径以工作区为根，绝对路径原样返回。
+   * 之前直接把参数当 cwd 用，相对路径会让 spawn 报 "python ENOENT"（其实是目录不存在）。
+   */
+  const inWorkspace = (p, exec) => {
+    const raw = clean(p)
+    const root = workflowOf(exec)
+    return raw ? resolve(root, raw) : root
+  }
   const jobDir = () => {
     const dir = join(dshHome(), 'cache', 'film-studio')
     mkdirSync(dir, { recursive: true })
     return dir
   }
 
+  // 启动标记：apply 到底有没有跑起来，重启后看这个文件就知道，不用猜。
+  let loadState = 'ok'
+  try {
+    const dir = jobDir()
+    writeFileSync(
+      join(dir, 'loaded.json'),
+      JSON.stringify({ at: new Date().toISOString(), pid: process.pid, config: { voice: config.defaultVoice ?? null, rate: config.defaultRate ?? null }, hasKey: Boolean(apiKeyOf()) }, null, 2),
+      'utf8',
+    )
+  } catch (error) {
+    loadState = error.message
+  }
+
+  const registered = []
   const skillStates = ['flash-motion', 'film-studio'].map(n => ({ name: n, ...installSkill(n, ctx.logger) }))
+  if (loadState !== 'ok') ctx.logger?.warn?.(`film-studio: 启动标记写入失败（${loadState}）`)
 
   ctx.effect(
-    () =>
-      ctx.tools.register(
+    () => {
+      const d = ctx.tools.register(
         defineTool({
           name: 'film_voice',
           description:
@@ -187,6 +288,7 @@ export function apply(ctx, config = {}) {
             seed: { type: 'number', description: '随机种子，便于复现同一版声音。' },
             sceneGroups: {
               type: 'object',
+              additionalProperties: true,
               description: '场景分组：{"hook":[0,1],"p1":[2,3]}，值为该场景第一句的下标范围；用于生成 timeline.js。',
             },
             asrCheck: {
@@ -202,8 +304,12 @@ export function apply(ctx, config = {}) {
           output: TEXT_OUTPUT,
           timeoutMs: 2_400_000,
           async execute(args, exec) {
-            const outDir = clean(args.outDir) || workflowOf(exec)
-            mkdirSync(outDir, { recursive: true })
+            const outDir = inWorkspace(args.outDir, exec)
+            try {
+              mkdirSync(outDir, { recursive: true })
+            } catch (error) {
+              return { text: `输出目录不可用：${outDir}\n${error.message}` }
+            }
             const job = {
               sentences: args.sentences,
               outDir,
@@ -224,7 +330,7 @@ export function apply(ctx, config = {}) {
             }
             const jobFile = join(jobDir(), `voice-job-${Date.now()}.json`)
             writeFileSync(jobFile, JSON.stringify(job, null, 1), 'utf8')
-            const r = await run(python, [join(PKG_DIR, 'scripts', 'filmvoice.py'), '--job', jobFile], {
+            const r = await runPython(python, [join(PKG_DIR, 'scripts', 'filmvoice.py'), '--job', jobFile], {
               cwd: outDir,
               env: { ALIYUN_BAILIAN_API_KEY: apiKeyOf() || '', ALIYUN_BAILIAN_BASE_URL: baseUrlOf() },
             })
@@ -256,13 +362,16 @@ export function apply(ctx, config = {}) {
             return { text: lines.join('\n') }
           },
         }),
-      ),
+      )
+      registered.push('film_voice')
+      return d
+    },
     'film-studio: film_voice',
   )
 
   ctx.effect(
-    () =>
-      ctx.tools.register(
+    () => {
+      const d = ctx.tools.register(
         defineTool({
           name: 'film_new',
           description:
@@ -283,14 +392,14 @@ export function apply(ctx, config = {}) {
             const name = clean(args.name)
             if (!name) return { text: '缺少 name（工程目录名）' }
             const root = workflowOf(exec)
-            const target = resolve(root, name)
+            const target = inWorkspace(name, exec)
             const fm = join(skillPath(), 'scripts', 'fm.py')
-            if (!existsSync(fm)) return { text: `找不到 ${fm}。本工具依赖 flash-motion 技能（放在 <DSH_HOME>/skills/flash-motion/ 后重启）；不装也能用 film_voice 单独配音。` }
+            if (!existsSync(fm)) return { text: `找不到 ${fm}，技能可能没装好` }
             const argv = [fm, 'new', target, '--style', clean(args.style) || 'paper-press',
               '--ratio', clean(args.ratio) || '16:9']
             if (Number.isFinite(args.dur)) argv.push('--dur', String(args.dur))
             if (clean(args.title)) argv.push('--title', clean(args.title))
-            const r = await run(python, argv, { cwd: root })
+            const r = await runPython(python, argv, { cwd: root })
             if (r.code !== 0) return { text: `生成骨架失败（退出码 ${r.code}）\n${tail(r.err, 8)}` }
             return {
               text: [
@@ -301,13 +410,16 @@ export function apply(ctx, config = {}) {
             }
           },
         }),
-      ),
+      )
+      registered.push('film_new')
+      return d
+    },
     'film-studio: film_new',
   )
 
   ctx.effect(
-    () =>
-      ctx.tools.register(
+    () => {
+      const d = ctx.tools.register(
         defineTool({
           name: 'film_check',
           description:
@@ -319,23 +431,29 @@ export function apply(ctx, config = {}) {
           output: TEXT_OUTPUT,
           timeoutMs: 600_000,
           async execute(args, exec) {
-            const cwd = clean(args.projectDir) || workflowOf(exec)
+            const cwd = inWorkspace(args.projectDir, exec)
+            if (!existsSync(cwd)) {
+              return { text: `工程目录不存在：${cwd}\n相对路径按工作区解析；也可以直接传绝对路径。` }
+            }
             const fm = join(skillPath(), 'scripts', 'fm.py')
-            if (!existsSync(fm)) return { text: `找不到 ${fm}。本工具依赖 flash-motion 技能（放在 <DSH_HOME>/skills/flash-motion/ 后重启）；不装也能用 film_voice 单独配音。` }
-            const r = await run(python, [fm, 'check', clean(args.html) || 'index.html'], { cwd })
+            if (!existsSync(fm)) return { text: `找不到 ${fm}，技能可能没装好` }
+            const r = await runPython(python, [fm, 'check', clean(args.html) || 'index.html'], { cwd })
             const summary = r.out.split(/\r?\n/).filter(x => x.includes('check 完成') || x.includes('[ERR]') || x.includes('[WARN]'))
             return {
               text: `${summary.join('\n') || tail(r.out, 4) || tail(r.err, 6)}`.trim(),
             }
           },
         }),
-      ),
+      )
+      registered.push('film_check')
+      return d
+    },
     'film-studio: film_check',
   )
 
   ctx.effect(
-    () =>
-      ctx.tools.register(
+    () => {
+      const d = ctx.tools.register(
         defineTool({
           name: 'film_render',
           description:
@@ -352,25 +470,35 @@ export function apply(ctx, config = {}) {
           output: TEXT_OUTPUT,
           timeoutMs: 2_400_000,
           async execute(args, exec) {
-            const cwd = clean(args.projectDir) || workflowOf(exec)
+            const cwd = inWorkspace(args.projectDir, exec)
+            if (!existsSync(cwd)) {
+              return { text: `工程目录不存在：${cwd}\n相对路径按工作区解析；也可以直接传绝对路径。` }
+            }
             const fm = join(skillPath(), 'scripts', 'fm.py')
-            if (!existsSync(fm)) return { text: `找不到 ${fm}。本工具依赖 flash-motion 技能（放在 <DSH_HOME>/skills/flash-motion/ 后重启）；不装也能用 film_voice 单独配音。` }
+            if (!existsSync(fm)) return { text: `找不到 ${fm}，技能可能没装好` }
             const argv = [fm, 'render', clean(args.html) || 'index.html',
               '--out', clean(args.out) || join('out', 'film.mp4'),
               '--mblur', String(Number.isFinite(args.mblur) ? args.mblur : 2),
               '--workers', String(Number.isFinite(args.workers) ? args.workers : 3)]
             if (args.audio === false) argv.push('--no-audio')
             if (args.force !== false) argv.push('--force')
-            const r = await run(python, argv, { cwd })
+            const r = await runPython(python, argv, { cwd })
             const keys = ['[OK]', '[ERR]', '[INFO] 渲染']
             const summary = r.out.split(/\r?\n/).filter(x => keys.some(k => x.startsWith(k)))
             const t = summary.slice(-4).join('\n') || tail(r.err, 8)
             return { text: r.code === 0 ? `${t}\n渲染完成` : `渲染失败（退出码 ${r.code}）\n${t}` }
           },
         }),
-      ),
+      )
+      registered.push('film_render')
+      return d
+    },
     'film-studio: film_render',
   )
+
+  try {
+    writeFileSync(join(jobDir(), 'tools.json'), JSON.stringify({ at: new Date().toISOString(), registered }, null, 2), 'utf8')
+  } catch {}
 
   ctx.effect(() => () => {}, 'film-studio: lifecycle')
   for (const s of skillStates) {
